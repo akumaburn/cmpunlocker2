@@ -56,7 +56,8 @@ unlocks:
       fbpa_pll0_plm:  { addr: "0x009a3c7c", value: "0xffffffff" }
       fbpa_pll1_plm:  { addr: "0x009a3c80", value: "0xffffffff" }
       fbpa_pll2_plm:  { addr: "0x009a3c84", value: "0xffffffff" }
-      # unicast FBPA0 PLL PLM; the patch walks every active FBPA from here
+      # unicast FBPA0 PLL PLM; the patch walks every FBPA from here and reports
+      # ones whose window is orphaned (PRI error on a populated FBPA)
       fbpa0_pll_plm:  { addr: "0x00903c7c", value: "0xffffffff" }
 
   compute_throughput:

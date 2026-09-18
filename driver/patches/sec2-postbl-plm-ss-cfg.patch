@@ -66,7 +66,7 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
  
      {
          // If the new FB layout requires a scrubber ucode to scrub additional space, prepare it now
-@@ -4821,6 +4857,168 @@
+@@ -4821,6 +4857,289 @@
      // Setup arguments for bootstrapping GSP
      NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, kgspPrepareForBootstrap_HAL(pGpu, pKernelGsp, KGSP_BOOT_MODE_NORMAL));
  
@@ -98,11 +98,34 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
 +
 +        // Userspace NDIV tuning (170tune/hbm_mclk) checks and drives the PLL
 +        // through the unicast FBPA windows (0x900000 + n * 0x4000), whose PLMs
-+        // are separate from the broadcast ones above. Each active FBPA gets its
-+        // three PLL PLMs opened after the static table.
-+        #define SEC2_POSTBL_FBPA_UC_PLL_PLM(n) (0x00903c7cU + ((n) / 3U) * 0x4000U + ((n) % 3U) * 4U)
++        // are separate from the broadcast ones above. Each FBPA's three PLL
++        // PLMs follow the static table. The first read of an FBPA's PLL PLM,
++        // taken before anything is written, decides what it is:
++        //
++        //   0                 inactive; nothing to open.
++        //   PRI FLOORSWEEP    fused off; nothing to open.
++        //   PRI ORPHAN        populated and serving memory, but its unicast
++        //                     PLL window does not answer. Seen as a stable
++        //                     per-card condition that survives driver
++        //                     rebuilds, FLR and cold boots, while the
++        //                     broadcast PLMs on the same card open normally.
++        //                     Nothing here can fix it, so it is reported
++        //                     instead of being mistaken for an empty FBPA.
++        //   other PRI error   unreachable for another reason; reported.
++        //   anything else     live; its PLL PLMs are opened.
++        //
++        // A PRI error reads as 0xBADxxxxx with the error code in bits 31:8
++        // (NV_PPRIV_SYS_PRI_ERROR_CODE_*, dev_pri_ringstation_sys.h).
++        #define SEC2_POSTBL_FBPA_COUNT            12U
++        #define SEC2_POSTBL_FBPA_UC_PLL_PLM(n)    (0x00903c7cU + ((n) / 3U) * 0x4000U + ((n) % 3U) * 4U)
++        #define SEC2_POSTBL_IS_PRI_ERROR(v)       (((v) & 0xfff00000U) == 0xbad00000U)
++        #define SEC2_POSTBL_PRI_CODE_FLOORSWEEP   0x00badf13U
++        #define SEC2_POSTBL_PRI_CODE_ORPHAN       0x00badf20U
 +        const NvU32 plmStaticCount = NV_ARRAY_ELEMENTS(plmTable);
-+        const NvU32 plmTotal = plmStaticCount + 12U * 3U;
++        const NvU32 plmTotal = plmStaticCount + SEC2_POSTBL_FBPA_COUNT * 3U;
++        NvU32 fbpaLive = 0, fbpaInactive = 0, fbpaFloorswept = 0;
++        NvU32 fbpaOrphaned = 0, fbpaPriError = 0, fbpaFailed = 0;
++        NvU32 fbpa0PllPlm = 0;
 +
 +        NvU32 wpr2Lo = GPU_REG_RD32(pGpu, 0x001fa824U);
 +        NvU32 wpr2Hi = GPU_REG_RD32(pGpu, 0x001fa828U);
@@ -114,6 +137,7 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
 +        {
 +            NvBool opened = NV_FALSE;
 +            NvU32 plmAddr, plmValue, plmMask;
++            NvU32 fbpaBit = 0;
 +            const char *plmName;
 +
 +            if (plmIdx < plmStaticCount)
@@ -125,17 +149,69 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
 +            }
 +            else
 +            {
++                NvU32 uc   = plmIdx - plmStaticCount;
++                NvU32 fbpa = uc / 3U;
 +                NvU32 pre;
 +
-+                plmAddr  = SEC2_POSTBL_FBPA_UC_PLL_PLM(plmIdx - plmStaticCount);
++                fbpaBit  = NVBIT(fbpa);
++                plmAddr  = SEC2_POSTBL_FBPA_UC_PLL_PLM(uc);
 +                plmValue = 0xffffffffU;
 +                plmMask  = 0x000000ffU;
 +                plmName  = "FBPA_UC_PLL";
 +
-+                // Unpopulated FBPAs read 0 or a PRI error; nothing to open.
-+                pre = GPU_REG_RD32(pGpu, plmAddr);
-+                if (pre == 0U || (pre & 0xfff00000U) == 0xbad00000U)
++                // The FBPA was classified on its first PLM; only a live one
++                // has its other two looked at.
++                if ((uc % 3U) != 0U && (fbpaLive & fbpaBit) == 0U)
 +                    continue;
++
++                pre = GPU_REG_RD32(pGpu, plmAddr);
++                if (uc == 0U)
++                    fbpa0PllPlm = pre;
++
++                if ((uc % 3U) == 0U)
++                {
++                    if (pre == 0U)
++                    {
++                        fbpaInactive |= fbpaBit;
++                        continue;
++                    }
++                    if (SEC2_POSTBL_IS_PRI_ERROR(pre))
++                    {
++                        NvU32 code = pre >> 8;
++
++                        if (code == SEC2_POSTBL_PRI_CODE_FLOORSWEEP)
++                        {
++                            fbpaFloorswept |= fbpaBit;
++                        }
++                        else if (code == SEC2_POSTBL_PRI_CODE_ORPHAN)
++                        {
++                            fbpaOrphaned |= fbpaBit;
++                            NV_PRINTF(LEVEL_ERROR,
++                                      "SEC2_DEBUG: FBPA%u PLL window orphaned (PRI error 0x%08x at 0x%x) - "
++                                      "the FBPA is populated but its unicast PLL registers do not answer; "
++                                      "host HBM tuning cannot reach it\n",
++                                      fbpa, pre, plmAddr);
++                        }
++                        else
++                        {
++                            fbpaPriError |= fbpaBit;
++                            NV_PRINTF(LEVEL_ERROR,
++                                      "SEC2_DEBUG: FBPA%u PLL window unreachable (PRI error 0x%08x, code 0x%06x, at 0x%x)\n",
++                                      fbpa, pre, code, plmAddr);
++                        }
++                        continue;
++                    }
++                    fbpaLive |= fbpaBit;
++                }
++                else if (SEC2_POSTBL_IS_PRI_ERROR(pre))
++                {
++                    fbpaFailed |= fbpaBit;
++                    NV_PRINTF(LEVEL_ERROR,
++                              "SEC2_DEBUG: FBPA%u PLL PLM 0x%x reads PRI error 0x%08x; left closed\n",
++                              fbpa, plmAddr, pre);
++                    continue;
++                }
++
 +                if ((pre & plmMask) == (plmValue & plmMask))
 +                    continue;
 +            }
@@ -162,11 +238,56 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
 +                    opened = NV_TRUE;
 +            }
 +            if (!opened)
++            {
++                fbpaFailed |= fbpaBit;
 +                NV_PRINTF(LEVEL_ERROR,
 +                          "SEC2_DEBUG: FAILED to open %s(0x%x) after 2 attempts\n",
 +                          plmName, plmAddr);
++            }
 +        }
++
++        NV_PRINTF(LEVEL_ERROR,
++                  "SEC2_DEBUG: FBPA unicast PLL PLMs: live=0x%03x inactive=0x%03x floorswept=0x%03x "
++                  "orphaned=0x%03x pri_error=0x%03x failed=0x%03x\n",
++                  fbpaLive, fbpaInactive, fbpaFloorswept,
++                  fbpaOrphaned, fbpaPriError, fbpaFailed);
++
++        // 170tune/hbm_mclk read and verify NDIV through FBPA0's window, so
++        // that one decides whether live tuning works at all. Any other live
++        // FBPA it cannot reach would be left on the old clock.
++        {
++            const NvU32 fbpaUnreachable = fbpaOrphaned | fbpaPriError | fbpaFailed;
++            const char *fbpa0State = NULL;
++
++            if (fbpaOrphaned & NVBIT(0))
++                fbpa0State = "orphaned (PRI error on a populated FBPA)";
++            else if (fbpaPriError & NVBIT(0))
++                fbpa0State = "unreachable (PRI error)";
++            else if (fbpaFailed & NVBIT(0))
++                fbpa0State = "closed (PLM did not open)";
++            else if ((fbpaLive & NVBIT(0)) == 0U)
++                fbpa0State = "absent";
++
++            if (fbpa0State != NULL)
++                NV_PRINTF(LEVEL_ERROR,
++                          "SEC2_DEBUG: FBPA0 PLL window %s, PLM read 0x%08x - this card cannot "
++                          "host-tune HBM: 170tune/hbm_mclk cannot read or set NDIV on it\n",
++                          fbpa0State, fbpa0PllPlm);
++            else if (fbpaUnreachable != 0U)
++                NV_PRINTF(LEVEL_ERROR,
++                          "SEC2_DEBUG: FBPA mask 0x%03x PLL windows unreachable - a live NDIV change "
++                          "cannot be applied or verified on them; do not host-tune HBM on this card\n",
++                          fbpaUnreachable);
++            else
++                NV_PRINTF(LEVEL_ERROR,
++                          "SEC2_DEBUG: PLL PLMs open on every live FBPA (0x%03x); host HBM tuning available\n",
++                          fbpaLive);
++        }
++        #undef SEC2_POSTBL_PRI_CODE_ORPHAN
++        #undef SEC2_POSTBL_PRI_CODE_FLOORSWEEP
++        #undef SEC2_POSTBL_IS_PRI_ERROR
 +        #undef SEC2_POSTBL_FBPA_UC_PLL_PLM
++        #undef SEC2_POSTBL_FBPA_COUNT
 +
 +        GPU_REG_WR32(pGpu, 0x001fa824U, wpr2Lo);
 +        GPU_REG_WR32(pGpu, 0x001fa828U, wpr2Hi);
@@ -235,7 +356,7 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
      // Release the API lock if relaxed locking for parallel init is enabled
      NvBool bRelaxedLocking = _kgspShouldRelaxGspInitLocking(pGpu);
      if (bRelaxedLocking)
-@@ -5662,6 +5860,84 @@
+@@ -5662,6 +5981,84 @@
      pKernelGsp->gspRmBootUcodeSize   = 0;
  }
  
@@ -320,7 +441,7 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
  static NV_STATUS
  _kgspCreateSignatureMemdesc
  (
-@@ -5672,6 +5948,9 @@
+@@ -5672,6 +6069,9 @@
  {
      NV_STATUS status = NV_OK;
      NvU8 *pSignatureVa = NULL;
@@ -330,7 +451,7 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
      NvU64 flags = MEMDESC_FLAGS_NONE;
  
      if (confComputeForceUnprotAlloc(pGpu))
-@@ -5682,7 +5961,7 @@
+@@ -5682,7 +6082,7 @@
      // NOTE: align to 256 because that's the alignment needed for Booter DMA
      NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
          memdescCreate(&pKernelGsp->pSignatureMemdesc, pGpu,
@@ -339,7 +460,7 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
              NV_TRUE, ADDR_SYSMEM, NV_MEMORY_CACHED, flags));
  
      memdescTagAlloc(status,
-@@ -5694,8 +5973,48 @@
+@@ -5694,8 +6094,48 @@
          (pSignatureVa != NULL) ? NV_OK : NV_ERR_INSUFFICIENT_RESOURCES,
          fail_alloc);
  
@@ -390,7 +511,7 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
  
      memdescUnmapInternal(pGpu, pKernelGsp->pSignatureMemdesc, 0);
      pSignatureVa = NULL;
-@@ -5709,6 +6028,69 @@
+@@ -5709,6 +6149,69 @@
      memdescDestroy(pKernelGsp->pSignatureMemdesc);
      pKernelGsp->pSignatureMemdesc = NULL;
  
@@ -460,7 +581,7 @@ diff -Naur a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/
      return status;
  }
  
-@@ -6612,6 +6994,51 @@
+@@ -6612,6 +7115,51 @@
  {
      GspStaticConfigInfo *pGSCI = GPU_GET_GSP_STATIC_INFO(pGpu);
  
